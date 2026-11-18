@@ -20,7 +20,7 @@ import score
 
 ROOT = Path(__file__).resolve().parent
 HISTORY = ROOT / "results.csv"
-BENCHMARK = "themes575-4s-v1"
+BENCHMARK = "long575-tiny3-4s-v1"
 LOCAL_BUDGET = 4.0
 FIELDS = ("time", "label", "config", "mean_score", "mean_n", "per_case_n", "invalid",
           "slowest", "seed", "status", "solver_sha256", "cases", "source", "benchmark")
@@ -88,8 +88,9 @@ def cases():
         themes[name] = " ".join(words)
     result = score.themed_cases(themes)
     for name, words, forbidden in result:
-        if not (60 <= len(words) <= 92 and 565 <= sum(map(len, words)) <= 585):
+        if not (45 <= len(words) <= 92 and 565 <= sum(map(len, words)) <= 585):
             raise ValueError(f"Unrepresentative case {name}")
+    result.extend(score.tiny_cases())
     return result
 
 

@@ -2,7 +2,6 @@ import random
 import time
 
 CONFIG = {'TIME_BUDGET': 8.0,
- 'TINY_LETTERS': 40,
  'START_DENSITY': 1.15,
  'TOP_CANDIDATES': 12,
  'RANDOM_TRIES': 400,
@@ -10,7 +9,7 @@ CONFIG = {'TIME_BUDGET': 8.0,
  'BEST_FIT_SAMPLE': 6,
  'MAX_BLOCKERS': 3,
  'MAX_REPAIRS': 40,
- 'PORTFOLIO': [('longest_first', 'shared')],
+ 'PORTFOLIO': [['longest_first', 'shared']],
  'SEED': 1,
  'TIME_MARGIN': 0.035,
  'FALLBACK_RESERVE': 0.2,
@@ -19,7 +18,12 @@ CONFIG = {'TIME_BUDGET': 8.0,
  'FUTURE_BONUS': 0.05,
  'REPAIR_SAMPLE': 2000,
  'BRANCH_WIDTH': 6,
- 'BACKTRACK_PATIENCE': 40}
+ 'BACKTRACK_PATIENCE': 40,
+ 'BEAM_WIDTH': 12,
+ 'BEAM_CHILDREN': 4,
+ 'EXPECTED_NEW': 0.7,
+ 'BEAM_NOISE': 1.5,
+ 'TINY_LETTERS': 40}
 
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 DIRS = ((0, 1), (1, 0), (1, 1), (1, -1), (0, -1), (-1, 0), (-1, -1), (-1, 1))
@@ -390,6 +394,41 @@ def generate_grid(required_words, forbidden_words) -> list[str]:
     for word in required:
         spellings[word] = (word, word[::-1])
 
+    domain_cache = {}
+
+    def line_domains(n, deadline):
+        if n in domain_cache:
+            return domain_cache[n]
+        # A lane holds all forward and backward starts for one word on one line.
+        width = 1 << (max(2*n,(8*n*n).bit_length())-1).bit_length()
+        lanes = 0
+        for i in range(len(required)):
+            lanes |= 1 << (i*width)
+        full = lanes*((1 << (2*n))-1)
+        allowed = []
+        for offset in range(n):
+            check(deadline)
+            hits = {}
+            touched = 0
+            for i,word in enumerate(required):
+                for direction,spelling in enumerate(spellings[word]):
+                    for k,ch in enumerate(spelling):
+                        bit = 1 << (i*width+direction*n+(offset-k)%n)
+                        touched |= bit
+                        hits[ch] = hits.get(ch,0) | bit
+            row = {}
+            for ch in ALPHABET:
+                row[ch] = (full ^ touched) | hits.get(ch,0)
+            allowed.append(row)
+        stages = []
+        group = 1
+        while group < width:
+            pattern = ((1 << width)-1)//((1 << group)+1)
+            stages.append((group,pattern*lanes))
+            group *= 2
+        domain_cache[n] = width, lanes, full, allowed, stages
+        return domain_cache[n]
+
     def backtrack(n, deadline):
         global build_attempts
         build_attempts += 1
@@ -400,38 +439,59 @@ def generate_grid(required_words, forbidden_words) -> list[str]:
         filled = 0
         pending = set(required)
 
+        width, lanes, full, allowed, stages = line_domains(n,deadline)
+        live = [full]*(4*n)
+        totals = lanes*(8*n*n)
+        one_direction = (1 << n)-1
+
+        def filter_domains(written):
+            nonlocal totals
+            saved = {}
+            for cell,ch in written:
+                r,c = divmod(cell,n)
+                for line,offset in ((r,c),(n+c,r),(2*n+(c-r)%n,r),(3*n+(c+r)%n,r)):
+                    old = live[line]
+                    new = old & allowed[offset][ch]
+                    if old != new:
+                        saved.setdefault(line,old)
+                        live[line] = new
+            before = totals
+            for line,old in saved.items():
+                lost = old ^ live[line]
+                # Parallel population count within every word's lane.
+                for group,mask in stages:
+                    lost = (lost & mask) + ((lost >> group) & mask)
+                totals -= lost
+            return before,saved
+
         def domains():
-            allowed = []
-            for axis in range(4):
-                available = {}
-                for letter in ALPHABET:
-                    available[letter] = vacant[axis] | letters[axis].get(letter,0)
-                allowed.append(available)
             fewest = 8*n*n+1
             winner = None
-            options = None
-            for word in required:
+            counts = totals.to_bytes((width*len(required)+7)//8,"little")
+            for i,word in enumerate(required):
                 if word not in pending:
                     continue
-                count = 0
-                feasible = []
-                for axis, available in enumerate(allowed):
-                    for spelling in spellings[word]:
-                        choices = starts
-                        for k, ch in enumerate(spelling):
-                            choices &= available[ch] >> k
-                            if not choices:
-                                break
-                        if choices:
-                            count += choices.bit_count()
-                            feasible.append((axis,spelling,choices))
-                    if count >= fewest:
-                        break
-                if count == 0:
-                    return None, None
+                if width >= 8:
+                    start = i*(width//8)
+                    count = int.from_bytes(counts[start:start+width//8],"little")
+                else:
+                    count = (totals >> (i*width)) & ((1 << width)-1)
+                if not count:
+                    return None,None
                 if count < fewest:
-                    fewest, winner, options = count, word, feasible
-            return winner, options
+                    fewest, winner, shift = count, word, i*width
+            options = []
+            for axis in range(4):
+                forward = reverse = 0
+                for line in range(n):
+                    lane = live[axis*n+line] >> shift
+                    forward |= (lane & one_direction) << (2*n*line)
+                    reverse |= ((lane >> n) & one_direction) << (2*n*line)
+                if forward:
+                    options.append((axis,winner,forward))
+                if reverse:
+                    options.append((axis,spellings[winner][1],reverse))
+            return winner,options
 
         def placements(word, options):
             ranked = []
@@ -507,43 +567,53 @@ def generate_grid(required_words, forbidden_words) -> list[str]:
                                 return None
             return verify(grid,deadline)
 
-        # Each frame owns its newly written cells until that choice is undone.
-        stack = []
-        deepest = stalled = 0
-        while stalled <= CONFIG["BACKTRACK_PATIENCE"]:
+        def snapshot():
+            saved_letters = []
+            for board in letters:
+                saved_letters.append(board.copy())
+            return (pending.copy(),cells.copy(),vacant.copy(),saved_letters,
+                    filled,live.copy(),totals)
+
+        beam = [(0.0,0.0,0,snapshot())]
+        high = lanes << (width-1)
+        for depth in range(len(required)):
             check(deadline)
-            if not pending:
-                result = finish()
-                if result is not None:
-                    return result
-                word = None
-            else:
-                word, options = domains()
-            if word is not None:
-                ranked = placements(word,options)
-                ranked.reverse()
-                stack.append([word,ranked,[]])
+            children = []
+            for _,_,length_sum,state in beam:
+                pending,cells,vacant,letters,filled,live,totals = state
+                word,options = domains()
+                if word is None:
+                    continue
                 pending.remove(word)
-                if len(stack) > deepest:
-                    deepest, stalled = len(stack), 0
-            while stack:
-                check(deadline)
-                word, ranked, previous = stack[-1]
-                toggle(previous)
-                if ranked:
-                    _, _, _, path, spelling = ranked.pop()
+                branches = placements(word,options)
+                if depth == 0:
+                    branches = branches[:1]
+                for _,_,_,path,spelling in branches[:CONFIG["BEAM_CHILDREN"]]:
+                    check(deadline)
                     written = []
-                    for cell, letter in zip(path,spelling):
+                    for cell,ch in zip(path,spelling):
                         if cells[cell] == ".":
-                            written.append((cell,letter))
-                    toggle(written)
-                    stack[-1][2] = written
-                    break
-                pending.add(word)
-                stack.pop()
-            else:
+                            written.append((cell,ch))
+                    delta = filter_domains(written)
+                    if (~totals & (totals-lanes) & high) == 0:
+                        toggle(written)
+                        if not pending:
+                            result = finish()
+                            if result is not None:
+                                return result
+                        else:
+                            length = length_sum+len(word)
+                            value = (CONFIG["EXPECTED_NEW"]*length - filled.bit_count()
+                                     + rng.random()*CONFIG["BEAM_NOISE"])
+                            children.append((value,rng.random(),length,snapshot()))
+                        toggle(written)
+                    totals,saved = delta
+                    for line,old in saved.items():
+                        live[line] = old
+            if not children:
                 return None
-            stalled += 1
+            children.sort(reverse=True)
+            beam = children[:CONFIG["BEAM_WIDTH"]]
         return None
 
     target = longest

@@ -137,17 +137,18 @@ THEMES = {
 }
 
 
-def themed_cases(themes=THEMES, target_letters=575):
+def themed_cases(themes=THEMES, target_letters=575, length_bias=1.0):
     cases = []
     for index, (name, source) in enumerate(themes.items()):
         rng = random.Random(101 + index)
         pool = list(dict.fromkeys(source.upper().split()))
         rng.shuffle(pool)
+        pool.sort(key=lambda word: len(word)*length_bias+rng.random()*3,reverse=True)
         required = []
         total = 0
         for word in pool:
             assert 4 <= len(word) <= 12
-            if len(required) >= 60 and abs(total - target_letters) <= abs(total + len(word) - target_letters):
+            if required and abs(total - target_letters) <= abs(total + len(word) - target_letters):
                 break
             required.append(word)
             total += len(word)
@@ -164,6 +165,14 @@ def themed_cases(themes=THEMES, target_letters=575):
                 forbidden.append(word)
         cases.append((name, required, forbidden))
     return cases
+
+
+def tiny_cases():
+    return [
+        ("tiny fruit and nuts", ["LIME","PEAR","FIG","NUT"], ["PIG"]),
+        ("tiny elements", ["SILVER","TIN","BORON"], ["ION"]),
+        ("tiny trees", ["ELM","ASH","YEW","OAK","FIR","BAY"], ["SAP","RYE"]),
+    ]
 
 
 def benchmark(mod, cases, label):
@@ -220,4 +229,4 @@ if __name__ == "__main__":
     elif batch == "original-2":
         benchmark(mod, cases[6:], "Original 2")
     if batch in ("all", "themed"):
-        benchmark(mod, themed_cases(), "Themed")
+        benchmark(mod, themed_cases() + tiny_cases(), "Themed and tiny")
