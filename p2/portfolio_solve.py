@@ -1,0 +1,631 @@
+# Word Search, version that scored 63.11 on HackerRank (best_solve.py alone scored 61.05).
+# It runs the best_solve.py builder 12 times inside the time limit (different seeds, and with
+# overlapping words merged first) and keeps the smallest valid grid.
+import random
+import time
+
+CONFIG = {'TIME_BUDGET': 8.0,
+ 'START_DENSITY': 1.15,
+ 'TOP_CANDIDATES': 12,
+ 'RANDOM_TRIES': 400,
+ 'TOUCH_WEIGHT': 1.0,
+ 'BEST_FIT_SAMPLE': 6,
+ 'MAX_BLOCKERS': 3,
+ 'MAX_REPAIRS': 40,
+ 'PORTFOLIO': [('longest_first', 'shared')],
+ 'SEED': 1,
+ 'TIME_MARGIN': 0.035,
+ 'FALLBACK_RESERVE': 0.2,
+ 'LIGHT_SHUFFLE_PROBABILITY': 0.25,
+ 'CROSSING_BONUS': 0.5,
+ 'FUTURE_BONUS': 0.05,
+ 'REPAIR_SAMPLE': 2000,
+ 'BRANCH_WIDTH': 6,
+ 'BACKTRACK_PATIENCE': 40}
+
+ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+DIRS = ((0, 1), (1, 0), (1, 1), (1, -1), (0, -1), (-1, 0), (-1, -1), (-1, 1))
+
+
+build_attempts = 0
+
+
+def check(deadline):
+    if time.monotonic() >= deadline:
+        raise TimeoutError("No verified grid before the deadline")
+
+
+def clean(words, deadline):
+    result = {}
+    for word in words:
+        check(deadline)
+        if isinstance(word, str):
+            word = word.strip().upper()
+            if word.isascii() and word.isalpha():
+                result[word] = None
+    return list(result)
+
+
+def big_string(grid, rep, deadline=float("inf")):
+    lines = []
+    left = []
+    right = []
+    for k, row in enumerate(grid):
+        check(deadline)
+        lines.append("".join(row) * rep)
+        left.append(row[k:] + row[:k])
+        right.append(row[-k:] + row[:-k])
+    for rows in (grid, left, right):
+        check(deadline)
+        for line in zip(*rows):
+            check(deadline)
+            lines.append("".join(line) * rep)
+    return "|".join(lines)
+
+
+def old_generate_grid(required_words, forbidden_words) -> list[str]:
+    global build_attempts
+    build_attempts = 0
+    end = time.monotonic() + min(8.0, CONFIG["TIME_BUDGET"]) - CONFIG["TIME_MARGIN"]
+    required = clean(required_words, end)
+    forbidden = clean(forbidden_words, end)
+    if not required:
+        if "A" in forbidden or any_a_cycle(forbidden, end):
+            raise ValueError('The prescribed ["A"] grid violates a forbidden word')
+        return ["A"]
+
+    required.sort(key=len, reverse=True)
+    longest = len(required[0])
+    total = 0
+    forbidden_max = 0
+    used = set()
+    patterns = set()
+    for word in forbidden:
+        check(end)
+        forbidden_max = max(forbidden_max, len(word))
+        used.update(word)
+        patterns.update((word, word[::-1]))
+    for word in required:
+        check(end)
+        total += len(word)
+        for pattern in patterns:
+            check(end)
+            if pattern in word:
+                raise ValueError("A required word contains a forbidden fragment")
+    filler = None
+    for letter in "QXZJKVWY" + ALPHABET:
+        check(end)
+        if letter not in used:
+            filler = letter
+            break
+    rng = random.Random(CONFIG["SEED"])
+
+    def has_forbidden(grid, deadline):
+        if patterns:
+            lines = big_string(grid, 2 + forbidden_max // len(grid), deadline)
+            for pattern in patterns:
+                check(deadline)
+                if pattern in lines:
+                    return True
+        return False
+
+    def verify(grid, deadline):
+        if has_forbidden(grid, deadline):
+            return None
+        lines = big_string(grid, 2, deadline)
+        for word in required:
+            check(deadline)
+            if word not in lines and word[::-1] not in lines:
+                return None
+        result = []
+        for row in grid:
+            check(deadline)
+            result.append("".join(row))
+        return result
+
+    def try_build(order, placement_rule, n, deadline):
+        global build_attempts
+        build_attempts += 1
+        grid = []
+        pos = {}
+        for _ in range(n):
+            check(deadline)
+            grid.append(["."] * n)
+
+        # A bit represents one grid cell. Union counts shared neighbours once.
+        occupied = 0
+        neighbours = []
+        for r in range(n):
+            check(deadline)
+            masks = []
+            for c in range(n):
+                check(deadline)
+                mask = 0
+                for dr, dc in DIRS:
+                    check(deadline)
+                    mask |= 1 << (((r + dr) % n) * n + (c + dc) % n)
+                masks.append(mask)
+            neighbours.append(masks)
+
+        def rank(word, start):
+            r, c, dr, dc = start
+            overlap = 0
+            adjacent = 0
+            for letter in word:
+                check(deadline)
+                cell = grid[r][c]
+                if cell == letter:
+                    overlap += 1
+                elif cell == ".":
+                    adjacent |= neighbours[r][c]
+                else:
+                    return None
+                r, c = (r + dr) % n, (c + dc) % n
+            if overlap == len(word):
+                return None
+            touching = (occupied & adjacent).bit_count()
+            return placement_rule(overlap), touching, rng.random(), start
+
+        def place(word, r, c, dr, dc):
+            nonlocal occupied
+            written = []
+            for letter in word:
+                check(deadline)
+                if grid[r][c] == ".":
+                    grid[r][c] = letter
+                    written.append((r, c))
+                r, c = (r + dr) % n, (c + dc) % n
+            if has_forbidden(grid, deadline):
+                for r, c in written:
+                    check(deadline)
+                    grid[r][c] = "."
+                return False
+            for r, c in written:
+                check(deadline)
+                occupied |= 1 << (r * n + c)
+                pos.setdefault(grid[r][c], []).append((r, c))
+            return True
+
+        for word in order:
+            check(deadline)
+            lines = big_string(grid, 2, deadline)
+            if word in lines or word[::-1] in lines:
+                continue
+            ranked = []
+            seen = set()
+            for k, letter in enumerate(word):
+                check(deadline)
+                for r, c in pos.get(letter, ()):
+                    check(deadline)
+                    for dr, dc in DIRS:
+                        check(deadline)
+                        start = ((r-k*dr) % n, (c-k*dc) % n, dr, dc)
+                        if start in seen:
+                            continue
+                        seen.add(start)
+                        entry = rank(word, start)
+                        if entry is not None:
+                            ranked.append(entry)
+            ranked.sort(reverse=True)
+            for _, _, _, start in ranked[:CONFIG["TOP_CANDIDATES"]]:
+                check(deadline)
+                if place(word, *start):
+                    break
+            else:
+                seen.clear()
+                sampled = []
+                for _ in range(CONFIG["RANDOM_TRIES"]):
+                    check(deadline)
+                    start = (rng.randrange(n), rng.randrange(n), *rng.choice(DIRS))
+                    if start in seen:
+                        continue
+                    seen.add(start)
+                    entry = rank(word, start)
+                    if entry is not None:
+                        sampled.append(entry)
+                        if not occupied:
+                            # All starts tie on an empty torus.
+                            break
+                sampled.sort(reverse=True)
+                for _, _, _, start in sampled:
+                    check(deadline)
+                    if place(word, *start):
+                        break
+                else:
+                    return None
+
+        for row in grid:
+            check(deadline)
+            for c, cell in enumerate(row):
+                check(deadline)
+                if cell != ".":
+                    continue
+                if filler:
+                    row[c] = filler
+                    continue
+                for letter in rng.sample(ALPHABET, 26):
+                    check(deadline)
+                    row[c] = letter
+                    if not has_forbidden(grid, deadline):
+                        break
+                else:
+                    return None
+        return verify(grid, deadline)
+
+    geometry_cache = {}
+
+    def geometry(n, deadline):
+        if n in geometry_cache:
+            return geometry_cache[n]
+        masks, neighbours = [], []
+        lines = [[], [], [], []]
+        starts = 0
+        for r in range(n):
+            check(deadline)
+            starts |= ((1 << n)-1) << (2*n*r)
+            for c in range(n):
+                bits = []
+                for line, offset in ((r,c),(c,r),((c-r)%n,r),((c+r)%n,r)):
+                    bits.append(((1<<n)+1) << (2*n*line+offset))
+                masks.append(bits)
+                adjacent = 0
+                for dr, dc in DIRS:
+                    adjacent |= 1 << (((r+dr)%n)*n+(c+dc)%n)
+                neighbours.append(adjacent)
+        for axis, (dr,dc) in enumerate(DIRS[:4]):
+            for line in range(n):
+                check(deadline)
+                r, c = (line,0) if axis == 0 else (0,line)
+                cells = []
+                for _ in range(n):
+                    cells.append(r*n+c)
+                    r,c = (r+dr)%n, (c+dc)%n
+                lines[axis].append(cells*2)
+        geometry_cache[n] = starts, masks, neighbours, lines
+        return geometry_cache[n]
+
+    spellings = {}
+    for word in required:
+        spellings[word] = (word, word[::-1])
+
+    def backtrack(n, deadline):
+        global build_attempts
+        build_attempts += 1
+        starts, cell_masks, neighbours, lines = geometry(n,deadline)
+        vacant = [(1 << (2*n*n))-1]*4
+        letters = [{},{},{},{}]
+        cells = ["."]*(n*n)
+        filled = 0
+        pending = set(required)
+
+        def domains():
+            allowed = []
+            for axis in range(4):
+                available = {}
+                for letter in ALPHABET:
+                    available[letter] = vacant[axis] | letters[axis].get(letter,0)
+                allowed.append(available)
+            fewest = 8*n*n+1
+            winner = None
+            options = None
+            for word in required:
+                if word not in pending:
+                    continue
+                count = 0
+                feasible = []
+                for axis, available in enumerate(allowed):
+                    for spelling in spellings[word]:
+                        choices = starts
+                        for k, ch in enumerate(spelling):
+                            choices &= available[ch] >> k
+                            if not choices:
+                                break
+                        if choices:
+                            count += choices.bit_count()
+                            feasible.append((axis,spelling,choices))
+                    if count >= fewest:
+                        break
+                if count == 0:
+                    return None, None
+                if count < fewest:
+                    fewest, winner, options = count, word, feasible
+            return winner, options
+
+        def placements(word, options):
+            ranked = []
+            for axis, spelling, choices in options:
+                check(deadline)
+                # Choose starts with maximum overlap across this line family.
+                counts = []
+                for k in range(len(word)):
+                    carry = choices & ~(vacant[axis] >> k)
+                    for j, plane in enumerate(counts):
+                        if not carry:
+                            break
+                        counts[j] = plane ^ carry
+                        carry &= plane
+                    if carry:
+                        counts.append(carry)
+                sampled = 0
+                while choices and sampled < CONFIG["BRANCH_WIDTH"]:
+                    mask = choices
+                    overlap = 0
+                    for j in range(len(counts)-1,-1,-1):
+                        more = mask & counts[j]
+                        if more:
+                            mask = more
+                            overlap |= 1 << j
+                    while mask and sampled < CONFIG["BRANCH_WIDTH"]:
+                        pick = mask
+                        while pick & (pick-1):
+                            half = pick & rng.getrandbits(pick.bit_length())
+                            if half:
+                                pick = half
+                        mask ^= pick
+                        choices ^= pick
+                        sampled += 1
+                        line, offset = divmod(pick.bit_length()-1,2*n)
+                        path = lines[axis][line][offset:offset+len(word)]
+                        adjacent = 0
+                        for cell in path:
+                            if cells[cell] == ".":
+                                adjacent |= neighbours[cell]
+                        touching = (filled & adjacent).bit_count()
+                        ranked.append((overlap,touching,rng.random(),path,spelling))
+            ranked.sort(reverse=True)
+            return ranked[:CONFIG["BRANCH_WIDTH"]]
+
+        def toggle(written):
+            nonlocal filled
+            for cell, letter in written:
+                filled ^= 1 << cell
+                cells[cell] = letter if cells[cell] == "." else "."
+                for axis, mask in enumerate(cell_masks[cell]):
+                    vacant[axis] ^= mask
+                    board = letters[axis]
+                    board[letter] = board.get(letter,0) ^ mask
+
+        def finish():
+            grid = []
+            for r in range(n):
+                check(deadline)
+                row = cells[r*n:(r+1)*n]
+                grid.append(row)
+            for row in grid:
+                for j,ch in enumerate(row):
+                    if ch == ".":
+                        if filler:
+                            row[j] = filler
+                        else:
+                            for letter in rng.sample(ALPHABET,26):
+                                row[j] = letter
+                                if not has_forbidden(grid,deadline):
+                                    break
+                            else:
+                                return None
+            return verify(grid,deadline)
+
+        # Each frame owns its newly written cells until that choice is undone.
+        stack = []
+        deepest = stalled = 0
+        while stalled <= CONFIG["BACKTRACK_PATIENCE"]:
+            check(deadline)
+            if not pending:
+                result = finish()
+                if result is not None:
+                    return result
+                word = None
+            else:
+                word, options = domains()
+            if word is not None:
+                ranked = placements(word,options)
+                ranked.reverse()
+                stack.append([word,ranked,[]])
+                pending.remove(word)
+                if len(stack) > deepest:
+                    deepest, stalled = len(stack), 0
+            while stack:
+                check(deadline)
+                word, ranked, previous = stack[-1]
+                toggle(previous)
+                if ranked:
+                    _, _, _, path, spelling = ranked.pop()
+                    written = []
+                    for cell, letter in zip(path,spelling):
+                        if cells[cell] == ".":
+                            written.append((cell,letter))
+                    toggle(written)
+                    stack[-1][2] = written
+                    break
+                pending.add(word)
+                stack.pop()
+            else:
+                return None
+            stalled += 1
+        return None
+
+    target = longest
+    while 17 * target * target < 10 * total:
+        check(end)
+        target += 1
+    n = target
+    while total / (n * n) > CONFIG["START_DENSITY"]:
+        check(end)
+        n += 1
+
+    best = None
+    try:
+        while best is None:
+            check(end - CONFIG["FALLBACK_RESERVE"])
+            best = try_build(required, int, n, end - CONFIG["FALLBACK_RESERVE"])
+            n += 1
+    except TimeoutError:
+        pass
+    if best is None and filler:
+        n = max(target, len(required))
+        grid = []
+        for r in range(n):
+            check(end)
+            word = required[r] if r < len(required) else ""
+            grid.append(list(word.ljust(n, filler)))
+        best = verify(grid, end)
+    try:
+        while best is not None and len(best) > target:
+            check(end)
+            candidate = backtrack(len(best)-1,end)
+            if candidate is not None:
+                best = candidate
+    except TimeoutError:
+        pass
+    if best is None:
+        raise TimeoutError("No verified grid found")
+    return best
+
+
+def any_a_cycle(words, deadline):
+    for word in words:
+        check(deadline)
+        if word.strip("A") == "":
+            return True
+    return False
+
+
+MERGE_MAX_LEN = 16
+MERGE_MIN_OV = 2
+PORT_TOTAL = 7.6
+PORT_A = 3.6
+PORT_B = 2.0
+PORT_C = 2.0
+
+
+def _m_ov(a, b):
+    k = min(len(a), len(b)) - 1
+    while k > 0:
+        if a.endswith(b[:k]):
+            return k
+        k -= 1
+    return 0
+
+
+def _merge_words(required, forbidden, max_len, min_ov):
+    fb = []
+    for f in forbidden:
+        if f:
+            fb.append(f)
+            fb.append(f[::-1])
+    items = []
+    for w in required:
+        if w not in items:
+            items.append(w)
+    kept = []
+    for w in sorted(items, key=len, reverse=True):
+        inside = False
+        for k in kept:
+            if w in k or w[::-1] in k:
+                inside = True
+                break
+        if not inside:
+            kept.append(w)
+    items = kept
+    while True:
+        best = None
+        best_ov = min_ov - 1
+        n = len(items)
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                for a in (items[i], items[i][::-1]):
+                    for b in (items[j], items[j][::-1]):
+                        o = _m_ov(a, b)
+                        if o <= best_ov:
+                            continue
+                        m = a + b[o:]
+                        if len(m) > max_len:
+                            continue
+                        bad = False
+                        for f in fb:
+                            if f in m:
+                                bad = True
+                                break
+                        if bad:
+                            continue
+                        best_ov = o
+                        best = (i, j, m)
+        if best is None:
+            break
+        i, j, m = best
+        new_items = []
+        for k in range(n):
+            if k != i and k != j:
+                new_items.append(items[k])
+        new_items.append(m)
+        items = new_items
+    return items
+
+
+def _contains_all(grid, required, forbidden):
+    n = len(grid)
+    ext = 0
+    for w in list(required) + list(forbidden):
+        if len(w) - 1 > ext:
+            ext = len(w) - 1
+    parts = []
+    for r in range(n):
+        s = "".join(grid[r])
+        parts.append(s + s[:ext])
+    for c in range(n):
+        chars = []
+        for r in range(n):
+            chars.append(grid[r][c])
+        s = "".join(chars)
+        parts.append(s + s[:ext])
+    for c in range(n):
+        chars = []
+        chars2 = []
+        for r in range(n):
+            chars.append(grid[r][(c + r) % n])
+            chars2.append(grid[r][(c - r) % n])
+        s = "".join(chars)
+        parts.append(s + s[:ext])
+        s = "".join(chars2)
+        parts.append(s + s[:ext])
+    text = "|".join(parts)
+    for w in required:
+        if w not in text and w[::-1] not in text:
+            return False
+    for f in forbidden:
+        if f and (f in text or f[::-1] in text):
+            return False
+    return True
+
+
+def generate_grid(required_words, forbidden_words):
+    t0 = time.monotonic()
+    required = list(required_words)
+    forbidden = list(forbidden_words)
+    best = None
+    plan = [('base', 1, 1.2, 0), ('merge', 1, 0.57, 16), ('base', 2, 0.57, 0), ('merge', 2, 0.57, 12), ('base', 3, 0.57, 0), ('merge', 3, 0.57, 20), ('base', 4, 0.57, 0), ('merge', 4, 0.57, 16), ('merge', 5, 0.57, 14), ('base', 5, 0.57, 0), ('merge', 6, 0.57, 18), ('merge', 7, 0.57, 16)]
+    for kind, seed, budget, mlen in plan:
+        left = PORT_TOTAL - (time.monotonic() - t0)
+        if left < 0.5:
+            break
+        if budget > left:
+            budget = left
+        g = None
+        try:
+            CONFIG['SEED'] = seed
+            CONFIG['TIME_BUDGET'] = budget
+            if kind == 'merge':
+                words = _merge_words(required, forbidden, mlen, MERGE_MIN_OV)
+            else:
+                words = list(required)
+            g = old_generate_grid(list(words), list(forbidden))
+            if g is not None and not _contains_all(g, required, forbidden):
+                g = None
+        except Exception:
+            g = None
+        if g is not None and (best is None or len(g) < len(best)):
+            best = g
+    CONFIG['SEED'] = 1
+    return best
