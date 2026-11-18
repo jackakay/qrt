@@ -1,0 +1,21 @@
+# secrets
+.env
+.env.*
+*.key
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# node
+node_modules/
+
+# editors and OS
+.DS_Store
+.vscode/
+.idea/
+
+# large or generated
+*.log
