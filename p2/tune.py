@@ -20,7 +20,7 @@ import score
 
 ROOT = Path(__file__).resolve().parent
 HISTORY = ROOT / "results.csv"
-BENCHMARK = "long575-tiny3-4s-v1"
+BENCHMARK = "long575-tiny3-4s-final"
 LOCAL_BUDGET = 4.0
 FIELDS = ("time", "label", "config", "mean_score", "mean_n", "per_case_n", "invalid",
           "slowest", "seed", "status", "solver_sha256", "cases", "source", "benchmark")

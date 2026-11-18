@@ -23,7 +23,10 @@ CONFIG = {'TIME_BUDGET': 8.0,
  'BEAM_CHILDREN': 4,
  'EXPECTED_NEW': 0.7,
  'BEAM_NOISE': 1.5,
- 'TINY_LETTERS': 40}
+ 'TINY_LETTERS': 40,
+ 'TINY_NODES': 48,
+ 'TINY_RESTARTS': 32,
+ 'TINY_RESTART_SECONDS': 0.06}
 
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 DIRS = ((0, 1), (1, 0), (1, 1), (1, -1), (0, -1), (-1, 0), (-1, -1), (-1, 1))
@@ -79,7 +82,9 @@ def tiny_grid(words, filler, has_forbidden, verify, best, deadline):
     while n*n < minimum_cells:
         n += 1
 
-    def placements(grid, word, first):
+    rng = random.Random(CONFIG["SEED"])
+
+    def placements(grid, word, first, randomize=False):
         check(deadline)
         text = big_string(grid, 2, deadline)
         if word in text or word[::-1] in text:
@@ -91,21 +96,24 @@ def tiny_grid(words, filler, has_forbidden, verify, best, deadline):
         directions = ((0,1),(1,1)) if first else DIRS
         if len(word) == 1:
             directions = ((0,1),)
-        for r in range(extent):
-            for c in range(extent):
-                check(deadline)
-                for dr,dc in directions:
-                    rr,cc = r,c
-                    written = []
-                    for ch in word:
-                        old = grid[rr][cc]
-                        if old == ".":
-                            written.append((rr,cc,ch))
-                        elif old != ch:
-                            break
-                        rr,cc = (rr+dr)%n,(cc+dc)%n
-                    else:
-                        yield written
+        origin = rng.randrange(extent*extent) if randomize else 0
+        if randomize:
+            directions = rng.sample(directions,len(directions))
+        for index in range(extent*extent):
+            r,c = divmod((index+origin) % (extent*extent),extent)
+            check(deadline)
+            for dr,dc in directions:
+                rr,cc = r,c
+                written = []
+                for ch in word:
+                    old = grid[rr][cc]
+                    if old == ".":
+                        written.append((rr,cc,ch))
+                    elif old != ch:
+                        break
+                    rr,cc = (rr+dr)%n,(cc+dc)%n
+                else:
+                    yield written
 
     def filled_grid(grid):
         empty = []
@@ -139,14 +147,17 @@ def tiny_grid(words, filler, has_forbidden, verify, best, deadline):
                 depth += 1
         return None
 
-    while best is None or n < len(best):
-        check(deadline)
+    def search_size(order, randomized, stop):
         grid = []
         for _ in range(n):
             grid.append(["."]*n)
-        stack = [[placements(grid,words[0],True),()]]
+        stack = [[placements(grid,order[0],True,randomized),()]]
+        nodes = 0
         while stack:
             check(deadline)
+            if randomized and (nodes >= CONFIG["TINY_NODES"] or time.monotonic() >= stop):
+                return None
+            nodes += 1
             choices,previous = stack[-1]
             for r,c,ch in previous:
                 grid[r][c] = "."
@@ -159,12 +170,28 @@ def tiny_grid(words, filler, has_forbidden, verify, best, deadline):
             stack[-1][1] = written
             if has_forbidden(grid,deadline):
                 continue
-            if len(stack) == len(words):
+            if len(stack) == len(order):
                 answer = filled_grid(grid)
                 if answer is not None:
                     return answer
             else:
-                stack.append([placements(grid,words[len(stack)],False),()])
+                stack.append([placements(grid,order[len(stack)],False,randomized),()])
+        return None
+
+    while best is None or n < len(best):
+        check(deadline)
+        stop = min(deadline,time.monotonic()+CONFIG["TINY_RESTART_SECONDS"])
+        order = list(words)
+        for _ in range(CONFIG["TINY_RESTARTS"]):
+            if time.monotonic() >= stop:
+                break
+            rng.shuffle(order)
+            answer = search_size(order,True,stop)
+            if answer is not None:
+                return answer
+        answer = search_size(words,False,deadline)
+        if answer is not None:
+            return answer
         n += 1
     return best
 
