@@ -1,0 +1,23 @@
+{
+  "TIME_BUDGET": 8.0,
+  "START_DENSITY": 1.15,
+  "TOP_CANDIDATES": 12,
+  "RANDOM_TRIES": 400,
+  "TOUCH_WEIGHT": 1.0,
+  "BEST_FIT_SAMPLE": 6,
+  "MAX_BLOCKERS": 3,
+  "MAX_REPAIRS": 40,
+  "PORTFOLIO": [
+    [
+      "longest_first",
+      "shared"
+    ]
+  ],
+  "SEED": 1,
+  "TIME_MARGIN": 0.035,
+  "FALLBACK_RESERVE": 0.2,
+  "LIGHT_SHUFFLE_PROBABILITY": 0.25,
+  "CROSSING_BONUS": 0.5,
+  "FUTURE_BONUS": 0.05,
+  "REPAIR_SAMPLE": 2000
+}
