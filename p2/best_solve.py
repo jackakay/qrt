@@ -2,6 +2,7 @@ import random
 import time
 
 CONFIG = {'TIME_BUDGET': 8.0,
+ 'TINY_LETTERS': 40,
  'START_DENSITY': 1.15,
  'TOP_CANDIDATES': 12,
  'RANDOM_TRIES': 400,
@@ -58,6 +59,110 @@ def big_string(grid, rep, deadline=float("inf")):
             check(deadline)
             lines.append("".join(line) * rep)
     return "|".join(lines)
+
+
+def tiny_grid(words, filler, has_forbidden, verify, best, deadline):
+    """Visit sizes in order, exhaust word placements, then exhaust safe fillings."""
+    needed = {}
+    for word in words:
+        counts = {}
+        for ch in word:
+            counts[ch] = counts.get(ch, 0) + 1
+        for ch, count in counts.items():
+            needed[ch] = max(needed.get(ch, 0), count)
+    n = len(words[0])
+    minimum_cells = sum(needed.values())
+    while n*n < minimum_cells:
+        n += 1
+
+    def placements(grid, word, first):
+        check(deadline)
+        text = big_string(grid, 2, deadline)
+        if word in text or word[::-1] in text:
+            yield ()
+            return
+        # Translation fixes the first start. Rotations and reflections leave
+        # just two distinct direction classes, axial and diagonal.
+        extent = 1 if first else n
+        directions = ((0,1),(1,1)) if first else DIRS
+        if len(word) == 1:
+            directions = ((0,1),)
+        for r in range(extent):
+            for c in range(extent):
+                check(deadline)
+                for dr,dc in directions:
+                    rr,cc = r,c
+                    written = []
+                    for ch in word:
+                        old = grid[rr][cc]
+                        if old == ".":
+                            written.append((rr,cc,ch))
+                        elif old != ch:
+                            break
+                        rr,cc = (rr+dr)%n,(cc+dc)%n
+                    else:
+                        yield written
+
+    def filled_grid(grid):
+        empty = []
+        for r,row in enumerate(grid):
+            check(deadline)
+            for c,ch in enumerate(row):
+                if ch == ".":
+                    empty.append((r,c))
+        if filler:
+            for r,c in empty:
+                grid[r][c] = filler
+            answer = verify(grid,deadline)
+            for r,c in empty:
+                grid[r][c] = "."
+            return answer
+        next_letter = [0]*len(empty)
+        depth = 0
+        while depth >= 0:
+            check(deadline)
+            if depth == len(empty):
+                return verify(grid,deadline)
+            r,c = empty[depth]
+            if next_letter[depth] == len(ALPHABET):
+                grid[r][c] = "."
+                next_letter[depth] = 0
+                depth -= 1
+                continue
+            grid[r][c] = ALPHABET[next_letter[depth]]
+            next_letter[depth] += 1
+            if not has_forbidden(grid,deadline):
+                depth += 1
+        return None
+
+    while best is None or n < len(best):
+        check(deadline)
+        grid = []
+        for _ in range(n):
+            grid.append(["."]*n)
+        stack = [[placements(grid,words[0],True),()]]
+        while stack:
+            check(deadline)
+            choices,previous = stack[-1]
+            for r,c,ch in previous:
+                grid[r][c] = "."
+            written = next(choices,None)
+            if written is None:
+                stack.pop()
+                continue
+            for r,c,ch in written:
+                grid[r][c] = ch
+            stack[-1][1] = written
+            if has_forbidden(grid,deadline):
+                continue
+            if len(stack) == len(words):
+                answer = filled_grid(grid)
+                if answer is not None:
+                    return answer
+            else:
+                stack.append([placements(grid,words[len(stack)],False),()])
+        n += 1
+    return best
 
 
 def generate_grid(required_words, forbidden_words) -> list[str]:
@@ -466,6 +571,13 @@ def generate_grid(required_words, forbidden_words) -> list[str]:
             word = required[r] if r < len(required) else ""
             grid.append(list(word.ljust(n, filler)))
         best = verify(grid, end)
+    if total < CONFIG["TINY_LETTERS"]:
+        try:
+            return tiny_grid(required, filler, has_forbidden, verify, best, end)
+        except TimeoutError:
+            if best is not None:
+                return best
+            raise
     try:
         while best is not None and len(best) > target:
             check(end)

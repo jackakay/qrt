@@ -96,7 +96,7 @@ THEMES = {
     Shannon Severn Tagus Douro Volga Dnieper Dniester Donets Vistula Elbe Loire
     Garonne Dordogne Drava Tigris Euphrates Jordan Indus Ganges Yamuna Brahmaputra Mekong
     Salween Irrawaddy Yangtze Huanghe Amur Lena Yenisei Angara Kolyma Limpopo Zambezi
-    Okavango Orange Congo Niger Senegal Gambia Murray Darling Murrumbidgee""",
+    Okavango Orange Congo Niger Senegal Gambia Murray Darling Murrumbidgee Penobscot Shenandoah Cumberland Rappahannock Tennessee Tombigbee Patapsco Potomac Saginaw Wabash Pecos Brazos Salinas Tuolumne Truckee Merced""",
     "countries": """Albania Algeria Angola Argentina Armenia Australia Austria Azerbaijan Bahamas
     Bahrain Bangladesh Barbados Belarus Belgium Belize Benin Bhutan Bolivia Botswana Brazil
     Brunei Bulgaria Burundi Cambodia Cameroon Canada Chad Chile China Colombia Comoros Croatia
@@ -137,7 +137,7 @@ THEMES = {
 }
 
 
-def themed_cases(themes=THEMES):
+def themed_cases(themes=THEMES, target_letters=575):
     cases = []
     for index, (name, source) in enumerate(themes.items()):
         rng = random.Random(101 + index)
@@ -147,11 +147,11 @@ def themed_cases(themes=THEMES):
         total = 0
         for word in pool:
             assert 4 <= len(word) <= 12
-            if len(required) >= 60 and abs(total - 500) <= abs(total + len(word) - 500):
+            if len(required) >= 60 and abs(total - target_letters) <= abs(total + len(word) - target_letters):
                 break
             required.append(word)
             total += len(word)
-            if len(required) == 80:
+            if len(required) == 92:
                 break
         forbidden = []
         for word in rng.sample("ASH GEM ICE JET ORE SAP SKY TEA WAX HAY RYE INK DEW MUD OIL".split(), 15):
@@ -198,6 +198,7 @@ def benchmark(mod, cases, label):
 
 if __name__ == "__main__":
     mod = importlib.import_module(sys.argv[1])
+    mod.CONFIG["TIME_BUDGET"] = 4.0
     real = []
     cases = [
         ("tiny example", ["ACE", "FIG", "OAK"], []),

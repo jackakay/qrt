@@ -9,6 +9,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import pprint
+import random
 import statistics
 import subprocess
 import tempfile
@@ -19,10 +20,12 @@ import score
 
 ROOT = Path(__file__).resolve().parent
 HISTORY = ROOT / "results.csv"
+BENCHMARK = "themes575-4s-v1"
+LOCAL_BUDGET = 4.0
 FIELDS = ("time", "label", "config", "mean_score", "mean_n", "per_case_n", "invalid",
-          "slowest", "seed", "status", "solver_sha256", "cases", "source")
+          "slowest", "seed", "status", "solver_sha256", "cases", "source", "benchmark")
 EXTRA = {
-    "constellations": """Andromeda Antlia Apus Aquarius Aquila Ara Aries Auriga Bootes Caelum
+    "night_sky": """Sirius Canopus Arcturus Rigel Vega Betelgeuse Altair Aldebaran Antares Spica Pollux Fomalhaut Deneb Capella Procyon Achernar Regulus Castor Polaris Andromeda Antlia Apus Aquarius Aquila Ara Aries Auriga Bootes Caelum
     Camelopardalis Cancer CanesVenatici CanisMajor CanisMinor Capricornus Carina Cassiopeia
     Centaurus Cepheus Cetus Chamaeleon Circinus Columba ComaBerenices Corvus Crater Crux Cygnus
     Delphinus Dorado Draco Equuleus Eridanus Fornax Gemini Grus Hercules Horologium Hydra
@@ -85,7 +88,7 @@ def cases():
         themes[name] = " ".join(words)
     result = score.themed_cases(themes)
     for name, words, forbidden in result:
-        if not (60 <= len(words) <= 80 and 460 <= sum(map(len, words)) <= 540):
+        if not (60 <= len(words) <= 92 and 565 <= sum(map(len, words)) <= 585):
             raise ValueError(f"Unrepresentative case {name}")
     return result
 
@@ -111,7 +114,8 @@ def worker(job):
         elapsed = time.monotonic() - start
         n, points, detail = 0, 0.0, traceback.format_exc()
     return dict(name=name, score=points, n=n, dt=elapsed, detail=detail,
-                attempts=ns["build_attempts"], winner=ns.get("winning_pair"))
+                attempts=ns["build_attempts"], winner=ns.get("winning_pair"),
+                diagnostics=ns.get("diagnostics",{}))
 
 
 def measure(source, config):
@@ -147,7 +151,7 @@ def measure(source, config):
 
 def log(label, source, config, measured, status):
     row = dict(measured)
-    row.update(time=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), label=label,
+    row.update(time=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), label=label, benchmark=BENCHMARK,
                config=config, seed=config["SEED"], status=status,
                solver_sha256=hashlib.sha256(source.encode()).hexdigest())
     for key in ("config", "cases", "per_case_n"):
@@ -212,27 +216,47 @@ def publish():
 def best_scores():
     scores = {}
     if HISTORY.exists():
-        with HISTORY.open(newline="") as handle:
-            pending = None
-            for row in csv.DictReader(handle):
-                if row["status"] == "confirming":
-                    pending = row
-                if row["status"] == "accepted" and pending:
-                    scores = {1: float(pending["mean_score"]), 2: float(row["mean_score"])}
+        pending = None
+        for row in history():
+            if row["status"] == "confirming":
+                pending = row
+            if row["status"] == "accepted" and pending and pending["label"] == row["label"]:
+                scores = {1:float(pending["mean_score"]),2:float(row["mean_score"])}
     return scores
+
+
+def with_tiny_search(source, incumbent):
+    """Preserve the mandatory tiny solver when replaying a pre-upgrade algorithm."""
+    if "def tiny_grid(" in source or "def tiny_grid(" not in incumbent:
+        return source
+    first = incumbent.index("def tiny_grid(")
+    last = incumbent.index("def generate_grid(",first)
+    source = source.replace("def generate_grid(",incumbent[first:last]+"def generate_grid(",1)
+    start = incumbent.index('    if total < CONFIG["TINY_LETTERS"]:')
+    end = incumbent.index("    try:\n        while best is not None",start)
+    anchor = "    try:\n        while best is not None"
+    if anchor not in source:
+        raise ValueError("Cannot safely attach tiny-grid search to this candidate")
+    return source.replace(anchor,incumbent[start:end]+anchor,1)
 
 
 def trial(label, source, settings, local):
     previous = best_scores()
+    incumbent = (ROOT / "best_solve.py").read_text() if (ROOT / "best_solve.py").exists() else source
+    source = with_tiny_search(source, incumbent)
     config = namespace(source)["CONFIG"].copy()
+    submission_budget = config["TIME_BUDGET"]
     config.update(settings)
+    config["TIME_BUDGET"] = submission_budget
+    config["TINY_LETTERS"] = 40
     config["SEED"] = 1
     source = embedded(source, config)
     for seed in (1, 2):
         run_config = config.copy()
         run_config["SEED"] = seed
+        run_config["TIME_BUDGET"] = min(LOCAL_BUDGET,config["TIME_BUDGET"])
         result = measure(source, run_config)
-        if (result["invalid"] or result["slowest"] > 8.3 or
+        if (result["invalid"] or result["slowest"] > LOCAL_BUDGET + 0.3 or
                 previous and result["mean_score"] < previous[seed] + 0.5):
             log(label, source, run_config, result, "rejected")
             return False
@@ -260,9 +284,13 @@ SWEEP = {
 }
 
 
-def history():
+def history(all_suites=False):
+    result = []
     with HISTORY.open(newline="") as handle:
-        return list(csv.DictReader(handle))
+        for row in csv.DictReader(handle):
+            if all_suites or row["benchmark"] == BENCHMARK:
+                result.append(row)
+    return result
 
 
 def sweep(local):
@@ -356,16 +384,228 @@ def variety_trial(rows, incumbent):
     raise ValueError("B2 benchmark missing")
 
 
+def explore(local):
+    """Make one measured change to the best backtracking solver."""
+    rows = history()
+    done = set()
+    incumbent = None
+    for row in rows:
+        if row["status"] in ("accepted","rejected"):
+            done.add(row["label"])
+        if row["status"] == "accepted":
+            incumbent = row
+    worst = min(json.loads(incumbent["cases"]), key=lambda case: case["score"])
+    print(f"Lowest confirmed case: {worst['name']} N={worst['n']}", flush=True)
+    config = json.loads((ROOT / "best_config.json").read_text())
+    source = (ROOT / "best_solve.py").read_text()
+    for key, values in (("BACKTRACK_PATIENCE",(8,20,80,160,320)),
+                        ("BRANCH_WIDTH",(2,3,4,8,12,20))):
+        for value in values:
+            if config.get(key) == value:
+                continue
+            label = f"backtrack.{key}={value}"
+            if label not in done:
+                trial(label, source, {key:value}, local)
+                return True
+    return False
+
+
+def packing_trial(local):
+    rows = history()
+    completed = set()
+    for row in rows:
+        completed.add(row["label"])
+        if row["status"] == "accepted":
+            latest = row
+    worst = min(json.loads(latest["cases"]), key=lambda case:case["score"])
+    print(f"Lowest confirmed case: {worst['name']} N={worst['n']}", flush=True)
+    current = json.loads((ROOT / "best_config.json").read_text())
+    source = (ROOT / "best_solve.py").read_text()
+    # Each family is tested individually against the live incumbent.
+    families = (
+        ("PACK_WEIGHT", (2.0,4.0,8.0,0.0,-1.0,16.0), "ranked.append((overlap,touching,rng.random(),path,spelling))",
+         'utility = overlap + CONFIG["PACK_WEIGHT"]*touching/(3*len(word)+6)\n'
+         '                        ranked.append((utility,overlap,rng.random(),path,spelling))'),
+        ("CANDIDATE_MULTIPLIER", (2,4,8,16), 'sampled < CONFIG["BRANCH_WIDTH"]',
+         'sampled < CONFIG["BRANCH_WIDTH"]*CONFIG["CANDIDATE_MULTIPLIER"]'),
+        ("RESTART_DEPTH", (4,8,12,16), "if len(stack) > deepest:",
+         'if len(stack) > deepest and len(stack) % CONFIG["RESTART_DEPTH"] == 0:'),
+    )
+    for key,values,before,after in families:
+        for value in values:
+            label = f"packing.{key}={value}"
+            if label in completed or current.get(key) == value:
+                continue
+            if before not in source and after not in source:
+                continue
+            variant = source if after in source else source.replace(before,after)
+            trial(label,variant,{key:value},local)
+            return True
+    return False
+
+
+# Rejected algorithm implementations remain replayable from the CSV while the
+# submission always contains the last confirmed winner.
+FAMILIES = {
+    "beam": {
+        "BEAM_WIDTH": (3,5,12,20),
+        "BEAM_CHILDREN": (2,3,6),
+        "EXPECTED_NEW": (0.45,0.85,1.0),
+        "BEAM_NOISE": (0.25,0.75,3.0,6.0),
+    },
+    "ejection_share": {
+        "EJECTION_SHARE": (0.1,0.4,0.65,0.9),
+        "EJECTION_START": (0.4,0.65,0.75),
+        "TABU_TENURE": (3,12,20),
+        "EJECTION_SAMPLE": (1,6,10),
+        "EJECTION_PATIENCE": (40,200,350),
+    },
+    "retain_partial": {
+        "RETAIN_FRACTION": (0.45,0.6,0.85,0.93),
+        "WARM_PROBABILITY": (0.3,0.6,0.95),
+    },
+}
+
+
+def snapshot_source(rows, digest):
+    for row in rows:
+        if row["solver_sha256"] == digest and row["source"]:
+            return row["source"]
+    raise ValueError("Solver snapshot missing: " + digest)
+
+
+def adaptive_trial(local):
+    """Select one previously untested neighbour of a measured solver."""
+    rows = history()
+    last_best = None
+    for row in rows:
+        if row["status"] == "accepted":
+            last_best = row
+    measured_cases = json.loads(last_best["cases"])
+    measured_cases.sort(key=lambda case:case["score"])
+    hardest = set()
+    for case in measured_cases[:3]:
+        hardest.add(case["name"])
+    families = []
+    visited = set()
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["label"],[]).append(row)
+    for family,parameters in FAMILIES.items():
+        reference = None
+        best_key = None
+        for label,runs in grouped.items():
+            if label != family and not label.startswith("adaptive."+family+"."):
+                continue
+            performance = []
+            difficult = []
+            for run in runs:
+                config = json.loads(run["config"])
+                config.pop("SEED",None)
+                visited.add((family,json.dumps(config,sort_keys=True)))
+                if int(run["invalid"]) or float(run["slowest"]) > LOCAL_BUDGET + 0.3:
+                    break
+                performance.append(float(run["mean_score"]))
+                for case in json.loads(run["cases"]):
+                    if case["name"] in hardest:
+                        difficult.append(case["score"])
+            else:
+                key = min(performance),statistics.mean(difficult)
+                if best_key is None or key > best_key:
+                    best_key,reference = key,runs[0]
+        if reference:
+            families.append((best_key,family,reference))
+    # Re-measure archives under this suite before using their scores as evidence.
+    for family in FAMILIES:
+        if family not in grouped:
+            archive = history(all_suites=True)
+            try:
+                source = historical_source(archive,family)
+            except ValueError:
+                continue
+            return trial(family,source,{},local)
+    if not families:
+        raise ValueError("No measured candidate families on this suite")
+    families.sort(key=lambda entry:entry[0],reverse=True)
+    # Alternate exploitation with round-robin coverage of promising mechanisms.
+    index = 0
+    for name in grouped:
+        if name.startswith("adaptive."):
+            index += 1
+    if index % 3 == 2:
+        order = (index//3)%len(families)
+        families = families[order:] + families[:order]
+    for key,family,reference in families:
+        parent = json.loads(reference["config"])
+        source = snapshot_source(rows,reference["solver_sha256"])
+        for setting,values in FAMILIES[family].items():
+            for value in values:
+                candidate = parent.copy()
+                candidate.pop("SEED",None)
+                candidate[setting] = value
+                if (family,json.dumps(candidate,sort_keys=True)) not in visited:
+                    label = f"adaptive.{family}.{index:04}.{setting}={value}"
+                    print(f"Lowest confirmed case: {measured_cases[0]['name']} "
+                          f"N={measured_cases[0]['n']}",flush=True)
+                    return trial(label,source,candidate,local)
+    # Once the discrete neighbours have been tested, explore intermediate
+    # values of one continuous control at a time around its best measured value.
+    rng = random.Random(index)
+    key,family,reference = families[index % len(families)]
+    source = snapshot_source(rows,reference["solver_sha256"])
+    config = json.loads(reference["config"])
+    setting = {"beam":"BEAM_NOISE","retain_partial":"RETAIN_FRACTION",
+               "ejection_share":"EJECTION_SHARE"}[family]
+    center = config[setting]
+    low,high = (0.0,8.0) if setting == "BEAM_NOISE" else (0.0,1.0)
+    while True:
+        candidate = config.copy()
+        candidate.pop("SEED",None)
+        value = round(rng.triangular(low,high,center),7)
+        candidate[setting] = value
+        if (family,json.dumps(candidate,sort_keys=True)) not in visited:
+            break
+    label = f"adaptive.{family}.{index:04}.{setting}={value}"
+    print(f"Lowest confirmed case: {measured_cases[0]['name']} N={measured_cases[0]['n']}",flush=True)
+    return trial(label,source,candidate,local)
+
+
+def improvement_loop(limit, local):
+    if limit < 35:
+        raise ValueError("Allow at least 35 seconds for a two-seed experiment")
+    end = time.monotonic()+limit
+    while time.monotonic()+34 < end:
+        accepted = adaptive_trial(local)
+        if accepted and local:
+            break  # The caller publishes the new snapshot before the next batch.
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("label")
     parser.add_argument("--source", default="solve.py")
+    parser.add_argument("--from-run",help="Replay the solver and CONFIG archived for an experiment label")
     parser.add_argument("--set", default="{}", type=json.loads)
     parser.add_argument("--local", action="store_true", help="Publish separately with tune.py publish")
+    parser.add_argument("--time-limit",type=float,default=45)
     args = parser.parse_args()
     if args.label == "publish":
         publish()
+    elif args.label == "loop":
+        improvement_loop(args.time_limit,args.local)
+    elif args.label == "next":
+        adaptive_trial(args.local)
+    elif args.label == "explore":
+        if not explore(args.local):
+            print("Backtrack parameter experiments complete")
+    elif args.label == "packing":
+        if not packing_trial(args.local):
+            print("Packing experiments complete")
     elif args.label == "sweep":
         sweep(args.local)
     else:
-        trial(args.label, (ROOT / args.source).read_text(), args.set, args.local)
+        if args.from_run:
+            source = historical_source(history(all_suites=True),args.from_run)
+        else:
+            source = (ROOT / args.source).read_text()
+        trial(args.label,source,args.set,args.local)
