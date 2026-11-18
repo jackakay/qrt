@@ -20,7 +20,7 @@ import score
 ROOT = Path(__file__).resolve().parent
 HISTORY = ROOT / "results.csv"
 FIELDS = ("time", "label", "config", "mean_score", "mean_n", "per_case_n", "invalid",
-          "slowest", "seed", "status", "solver_sha256", "cases")
+          "slowest", "seed", "status", "solver_sha256", "cases", "source")
 EXTRA = {
     "constellations": """Andromeda Antlia Apus Aquarius Aquila Ara Aries Auriga Bootes Caelum
     Camelopardalis Cancer CanesVenatici CanisMajor CanisMinor Capricornus Carina Cassiopeia
@@ -120,7 +120,17 @@ def measure(source, config):
         jobs.append((source, config, case))
     # One fresh worker per case, even if a trial fails immediately.
     with multiprocessing.get_context("spawn").Pool(len(jobs), maxtasksperchild=1) as pool:
-        rows = pool.map_async(worker, jobs, chunksize=1).get(timeout=35)
+        futures = []
+        for job in jobs:
+            futures.append(pool.apply_async(worker, (job,)))
+        limit = time.monotonic() + 16
+        rows = []
+        for job, future in zip(jobs, futures):
+            try:
+                rows.append(future.get(timeout=max(0.0, limit-time.monotonic())))
+            except multiprocessing.TimeoutError:
+                rows.append(dict(name=job[2][0], score=0.0, n=0, dt=16.0,
+                                 detail="Worker exceeded watchdog", attempts=0, winner=None))
     sizes = {}
     scores = []
     slowest = 0.0
@@ -143,6 +153,12 @@ def log(label, source, config, measured, status):
     for key in ("config", "cases", "per_case_n"):
         row[key] = json.dumps(row[key], sort_keys=True)
     new = not HISTORY.exists()
+    row["source"] = source
+    if not new:
+        for previous in history():
+            if previous["solver_sha256"] == row["solver_sha256"] and previous["source"]:
+                row["source"] = ""
+                break
     with HISTORY.open("a", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDS)
         if new:
@@ -176,7 +192,7 @@ def publish():
     files = ["solve.py", "best_solve.py", "best_config.json", "score.py", "tune.py", "results.csv"]
     def git(*args, env=None):
         proc = subprocess.run(["git", *args], cwd=ROOT, env=env, check=True, text=True,
-                              stdout=subprocess.PIPE, timeout=15)
+                              stdout=subprocess.PIPE, timeout=40 if "push" in args else 10)
         return proc.stdout.strip()
     with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
         env = os.environ.copy()
@@ -233,6 +249,113 @@ def trial(label, source, settings, local):
     return True
 
 
+SWEEP = {
+    "START_DENSITY": (1.10, 1.15, 1.20, 1.25),
+    "TOP_CANDIDATES": (6, 12, 20),
+    "RANDOM_TRIES": (100, 400),
+    "TOUCH_WEIGHT": (0.5, 1.0, 2.0),
+    "BEST_FIT_SAMPLE": (4, 6, 10),
+    "MAX_BLOCKERS": (2, 3, 4, 5),
+    "MAX_REPAIRS": (20, 40, 80),
+}
+
+
+def history():
+    with HISTORY.open(newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def sweep(local):
+    """Run one outstanding experiment. Separate invocations can safely resume a pass."""
+    rows = history()
+    done = set()
+    for row in rows:
+        if row["status"] in ("accepted", "rejected"):
+            done.add(row["label"])
+    incumbent = (ROOT / "best_solve.py").read_text()
+    current = json.loads((ROOT / "best_config.json").read_text())
+    for pass_number in (1, 2):
+        for key, values in SWEEP.items():
+            for value in values:
+                label = f"pass{pass_number}.{key}={value}"
+                if label in done:
+                    continue
+                source = incumbent
+                settings = current.copy()
+                if key in ("MAX_BLOCKERS", "MAX_REPAIRS") and "def repair(" not in source:
+                    source = historical_source(rows, "B3")
+                if key == "BEST_FIT_SAMPLE" and not uses_order(settings, "best_fit_next"):
+                    source, settings["PORTFOLIO"] = variety_trial(rows, incumbent)
+                if key == "TOUCH_WEIGHT" and 'CONFIG["TOUCH_WEIGHT"]' not in source:
+                    source = source.replace("return placement_rule(overlap), touching, rng.random(), start",
+                        'value = placement_rule(overlap) + CONFIG["TOUCH_WEIGHT"] * touching / (3*len(word)+6)\n'
+                        '            return value, touching, rng.random(), start')
+                settings[key] = value
+                trial(label, source, settings, local)
+                return
+        prefix = f"pass{pass_number}.portfolio"
+        stop_pruning = False
+        completed_drops = 0
+        for row in rows:
+            if row["label"].startswith(prefix):
+                if row["status"] == "rejected":
+                    stop_pruning = True
+                elif row["status"] == "accepted":
+                    completed_drops += 1
+        pruning = f"{prefix}.drop{completed_drops+1}"
+        if not stop_pruning and (len(current["PORTFOLIO"]) > 1 or completed_drops == 0):
+            if len(current["PORTFOLIO"]) > 1:
+                source, portfolio = incumbent, current["PORTFOLIO"]
+            else:
+                source, portfolio = variety_trial(rows, incumbent)
+            counts = {}
+            for pair in portfolio:
+                counts[tuple(pair)] = 0
+            for row in reversed(rows):
+                measured = json.loads(row["config"])
+                if measured["PORTFOLIO"] != portfolio:
+                    continue
+                for case in json.loads(row["cases"]):
+                    if case["winner"]:
+                        pair = tuple(case["winner"])
+                        counts[pair] += 1
+                break
+            loser = min(counts, key=counts.get)
+            reduced = []
+            for pair in portfolio:
+                if tuple(pair) != loser:
+                    reduced.append(pair)
+            if reduced:
+                trial(pruning, source, dict(current, PORTFOLIO=reduced), local)
+                return
+    print("Parameter passes complete", flush=True)
+
+
+def uses_order(config, name):
+    for order, rule in config["PORTFOLIO"]:
+        if order == name:
+            return True
+    return False
+
+
+def historical_source(rows, label):
+    for item in rows:
+        if item["label"] == label:
+            digest = item["solver_sha256"]
+            for archived in rows:
+                if archived["solver_sha256"] == digest and archived["source"]:
+                    return archived["source"]
+    raise ValueError(f"Missing solver snapshot for {label}")
+
+
+def variety_trial(rows, incumbent):
+    source = incumbent if "best_fit_next" in incumbent else historical_source(rows, "B2")
+    for row in rows:
+        if row["label"] == "B2":
+            return source, json.loads(row["config"])["PORTFOLIO"]
+    raise ValueError("B2 benchmark missing")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("label")
@@ -242,5 +365,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.label == "publish":
         publish()
+    elif args.label == "sweep":
+        sweep(args.local)
     else:
         trial(args.label, (ROOT / args.source).read_text(), args.set, args.local)

@@ -16,7 +16,9 @@ CONFIG = {'TIME_BUDGET': 8.0,
  'LIGHT_SHUFFLE_PROBABILITY': 0.25,
  'CROSSING_BONUS': 0.5,
  'FUTURE_BONUS': 0.05,
- 'REPAIR_SAMPLE': 2000}
+ 'REPAIR_SAMPLE': 2000,
+ 'BRANCH_WIDTH': 6,
+ 'BACKTRACK_PATIENCE': 40}
 
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 DIRS = ((0, 1), (1, 0), (1, 1), (1, -1), (0, -1), (-1, 0), (-1, -1), (-1, 1))
@@ -247,6 +249,198 @@ def generate_grid(required_words, forbidden_words) -> list[str]:
                     return None
         return verify(grid, deadline)
 
+    geometry_cache = {}
+
+    def geometry(n, deadline):
+        if n in geometry_cache:
+            return geometry_cache[n]
+        masks, neighbours = [], []
+        lines = [[], [], [], []]
+        starts = 0
+        for r in range(n):
+            check(deadline)
+            starts |= ((1 << n)-1) << (2*n*r)
+            for c in range(n):
+                bits = []
+                for line, offset in ((r,c),(c,r),((c-r)%n,r),((c+r)%n,r)):
+                    bits.append(((1<<n)+1) << (2*n*line+offset))
+                masks.append(bits)
+                adjacent = 0
+                for dr, dc in DIRS:
+                    adjacent |= 1 << (((r+dr)%n)*n+(c+dc)%n)
+                neighbours.append(adjacent)
+        for axis, (dr,dc) in enumerate(DIRS[:4]):
+            for line in range(n):
+                check(deadline)
+                r, c = (line,0) if axis == 0 else (0,line)
+                cells = []
+                for _ in range(n):
+                    cells.append(r*n+c)
+                    r,c = (r+dr)%n, (c+dc)%n
+                lines[axis].append(cells*2)
+        geometry_cache[n] = starts, masks, neighbours, lines
+        return geometry_cache[n]
+
+    spellings = {}
+    for word in required:
+        spellings[word] = (word, word[::-1])
+
+    def backtrack(n, deadline):
+        global build_attempts
+        build_attempts += 1
+        starts, cell_masks, neighbours, lines = geometry(n,deadline)
+        vacant = [(1 << (2*n*n))-1]*4
+        letters = [{},{},{},{}]
+        cells = ["."]*(n*n)
+        filled = 0
+        pending = set(required)
+
+        def domains():
+            allowed = []
+            for axis in range(4):
+                available = {}
+                for letter in ALPHABET:
+                    available[letter] = vacant[axis] | letters[axis].get(letter,0)
+                allowed.append(available)
+            fewest = 8*n*n+1
+            winner = None
+            options = None
+            for word in required:
+                if word not in pending:
+                    continue
+                count = 0
+                feasible = []
+                for axis, available in enumerate(allowed):
+                    for spelling in spellings[word]:
+                        choices = starts
+                        for k, ch in enumerate(spelling):
+                            choices &= available[ch] >> k
+                            if not choices:
+                                break
+                        if choices:
+                            count += choices.bit_count()
+                            feasible.append((axis,spelling,choices))
+                    if count >= fewest:
+                        break
+                if count == 0:
+                    return None, None
+                if count < fewest:
+                    fewest, winner, options = count, word, feasible
+            return winner, options
+
+        def placements(word, options):
+            ranked = []
+            for axis, spelling, choices in options:
+                check(deadline)
+                # Choose starts with maximum overlap across this line family.
+                counts = []
+                for k in range(len(word)):
+                    carry = choices & ~(vacant[axis] >> k)
+                    for j, plane in enumerate(counts):
+                        if not carry:
+                            break
+                        counts[j] = plane ^ carry
+                        carry &= plane
+                    if carry:
+                        counts.append(carry)
+                sampled = 0
+                while choices and sampled < CONFIG["BRANCH_WIDTH"]:
+                    mask = choices
+                    overlap = 0
+                    for j in range(len(counts)-1,-1,-1):
+                        more = mask & counts[j]
+                        if more:
+                            mask = more
+                            overlap |= 1 << j
+                    while mask and sampled < CONFIG["BRANCH_WIDTH"]:
+                        pick = mask
+                        while pick & (pick-1):
+                            half = pick & rng.getrandbits(pick.bit_length())
+                            if half:
+                                pick = half
+                        mask ^= pick
+                        choices ^= pick
+                        sampled += 1
+                        line, offset = divmod(pick.bit_length()-1,2*n)
+                        path = lines[axis][line][offset:offset+len(word)]
+                        adjacent = 0
+                        for cell in path:
+                            if cells[cell] == ".":
+                                adjacent |= neighbours[cell]
+                        touching = (filled & adjacent).bit_count()
+                        ranked.append((overlap,touching,rng.random(),path,spelling))
+            ranked.sort(reverse=True)
+            return ranked[:CONFIG["BRANCH_WIDTH"]]
+
+        def toggle(written):
+            nonlocal filled
+            for cell, letter in written:
+                filled ^= 1 << cell
+                cells[cell] = letter if cells[cell] == "." else "."
+                for axis, mask in enumerate(cell_masks[cell]):
+                    vacant[axis] ^= mask
+                    board = letters[axis]
+                    board[letter] = board.get(letter,0) ^ mask
+
+        def finish():
+            grid = []
+            for r in range(n):
+                check(deadline)
+                row = cells[r*n:(r+1)*n]
+                grid.append(row)
+            for row in grid:
+                for j,ch in enumerate(row):
+                    if ch == ".":
+                        if filler:
+                            row[j] = filler
+                        else:
+                            for letter in rng.sample(ALPHABET,26):
+                                row[j] = letter
+                                if not has_forbidden(grid,deadline):
+                                    break
+                            else:
+                                return None
+            return verify(grid,deadline)
+
+        # Each frame owns its newly written cells until that choice is undone.
+        stack = []
+        deepest = stalled = 0
+        while stalled <= CONFIG["BACKTRACK_PATIENCE"]:
+            check(deadline)
+            if not pending:
+                result = finish()
+                if result is not None:
+                    return result
+                word = None
+            else:
+                word, options = domains()
+            if word is not None:
+                ranked = placements(word,options)
+                ranked.reverse()
+                stack.append([word,ranked,[]])
+                pending.remove(word)
+                if len(stack) > deepest:
+                    deepest, stalled = len(stack), 0
+            while stack:
+                check(deadline)
+                word, ranked, previous = stack[-1]
+                toggle(previous)
+                if ranked:
+                    _, _, _, path, spelling = ranked.pop()
+                    written = []
+                    for cell, letter in zip(path,spelling):
+                        if cells[cell] == ".":
+                            written.append((cell,letter))
+                    toggle(written)
+                    stack[-1][2] = written
+                    break
+                pending.add(word)
+                stack.pop()
+            else:
+                return None
+            stalled += 1
+        return None
+
     target = longest
     while 17 * target * target < 10 * total:
         check(end)
@@ -275,7 +469,7 @@ def generate_grid(required_words, forbidden_words) -> list[str]:
     try:
         while best is not None and len(best) > target:
             check(end)
-            candidate = try_build(required, int, len(best) - 1, end)
+            candidate = backtrack(len(best)-1,end)
             if candidate is not None:
                 best = candidate
     except TimeoutError:
